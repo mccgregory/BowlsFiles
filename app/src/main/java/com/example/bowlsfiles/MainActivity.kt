@@ -1,12 +1,12 @@
 package com.example.bowlsfiles
 
-import android.content.Context
-import android.content.Intent
-import android.content.SharedPreferences
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -14,183 +14,309 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import java.io.File
+import com.google.android.gms.wearable.*
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.os.Environment
+import java.io.File
+import java.io.FileOutputStream
+import android.widget.Toast
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
+    private val matchFiles = mutableStateListOf<MatchFile>()
+    private var isRequestingFiles by mutableStateOf(false)
+
+    data class MatchFile(val summary: String, val rawContent: String, val timestamp: Long)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    FileManagerScreen()
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    MatchFilesScreen(
+                        matchFiles = matchFiles,
+                        isRequestingFiles = isRequestingFiles,
+                        onRefreshClicked = {
+                            matchFiles.clear()
+                            isRequestingFiles = true
+                            requestMatchFilesFromWatch()
+                        },
+                        onWatchStatusChecked = { callback ->
+                            checkWatchConnection { status ->
+                                callback(status ?: "Watch Connected: Unknown")
+                            }
+                        },
+                        onSaveFile = { matchFile ->
+                            saveFileToDownloads(matchFile)
+                        },
+                        onDeleteFile = { matchFile ->
+                            matchFiles.remove(matchFile)
+                        }
+                    )
                 }
             }
+        }
+    }
+
+    private fun checkWatchConnection(onStatusUpdate: (String?) -> Unit) {
+        val capabilityClient = Wearable.getCapabilityClient(this)
+        capabilityClient.getCapability("wear_os", CapabilityClient.FILTER_REACHABLE)
+            .addOnSuccessListener { capabilityInfo ->
+                onStatusUpdate(
+                    if (capabilityInfo.nodes.isNotEmpty()) {
+                        requestMatchFilesFromWatch()
+                        "Watch Connected: Yes"
+                    } else {
+                        "Watch Connected: No"
+                    }
+                )
+            }
+            .addOnFailureListener {
+                onStatusUpdate("Watch Connected: Error")
+            }
+    }
+
+    private fun requestMatchFilesFromWatch(retryCount: Int = 3, delayMs: Long = 2000) {
+        val capabilityClient = Wearable.getCapabilityClient(this)
+        capabilityClient.getCapability("wear_os", CapabilityClient.FILTER_REACHABLE)
+            .addOnSuccessListener { capabilityInfo ->
+                val nodeId = capabilityInfo.nodes.firstOrNull()?.id
+                if (nodeId != null) {
+                    val messageClient = Wearable.getMessageClient(this)
+                    messageClient.sendMessage(nodeId, "/request_match_files", byteArrayOf())
+                        .addOnSuccessListener {
+                            Log.d("PhoneApp", "Requested match files from node $nodeId")
+                        }
+                        .addOnFailureListener { e ->
+                            Log.e("PhoneApp", "Failed to request files, retryCount=$retryCount", e)
+                            if (retryCount > 0) {
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    requestMatchFilesFromWatch(retryCount - 1, delayMs)
+                                }, delayMs)
+                            } else {
+                                isRequestingFiles = false
+                            }
+                        }
+                } else {
+                    Log.w("PhoneApp", "No watch nodes found")
+                    isRequestingFiles = false
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.e("PhoneApp", "Failed to get capability", e)
+                isRequestingFiles = false
+            }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Wearable.getDataClient(this).addListener(this)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Wearable.getDataClient(this).removeListener(this)
+    }
+
+    override fun onDataChanged(dataEvents: DataEventBuffer) {
+        for (event in dataEvents) {
+            if (event.type == DataEvent.TYPE_CHANGED) {
+                val item = event.dataItem
+                if (item.uri.path?.startsWith("/match_files/") == true) {
+                    val dataMap = DataMapItem.fromDataItem(item).dataMap
+                    val matchData = dataMap.getString("match_data")
+                    val timestamp = dataMap.getLong("timestamp")
+                    val summary = parseMatchData(matchData, timestamp)
+                    matchFiles.add(MatchFile(summary, matchData ?: "", timestamp))
+                    Log.d("PhoneApp", "Received file: ${item.uri.path}")
+                }
+            }
+        }
+        isRequestingFiles = false
+    }
+
+    private fun parseMatchData(matchData: String?, timestamp: Long): String {
+        if (matchData.isNullOrBlank()) {
+            return "Match Summary (Received: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))})\n- Error: No match data available"
+        }
+
+        val lines = matchData.split("\n")
+        var startTime = "Unknown"
+        var endTime = "Unknown"
+        var duration = "Unknown"
+        var finalScore = "Unknown"
+
+        lines.forEach { line ->
+            when {
+                line.startsWith("Start Time:") -> startTime = line.removePrefix("Start Time: ").trim()
+                line.startsWith("End Time:") -> endTime = line.removePrefix("End Time: ").trim()
+                line.startsWith("Elapsed Time:") -> duration = line.removePrefix("Elapsed Time: ").trim()
+                line.startsWith("End ") && line.contains(":") -> {
+                    if (line.contains("Game Scores")) return@forEach
+                    val parts = line.split("End \\d+: \\d+-\\d+".toRegex(), limit = 2)
+                    if (parts.size > 1) {
+                        val gameScore = parts[1].trim().split("-")
+                        if (gameScore.size == 2) {
+                            finalScore = "${gameScore[0]}-${gameScore[1]}"
+                        }
+                    }
+                }
+            }
+        }
+
+        return """
+            Match Summary (Received: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))})
+            - Start: $startTime
+            - End: $endTime
+            - Duration: $duration
+            - Final Score: $finalScore
+        """.trimIndent()
+    }
+
+    private fun saveFileToDownloads(matchFile: MatchFile) {
+        try {
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val fileName = "Match_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(matchFile.timestamp))}.txt"
+            val file = File(downloadsDir, fileName)
+            FileOutputStream(file).use { output ->
+                output.write(matchFile.rawContent.toByteArray())
+            }
+            Toast.makeText(this, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Log.e("PhoneApp", "Failed to save file: ${e.message}")
+            Toast.makeText(this, "Failed to save file: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 }
 
 @Composable
-fun FileManagerScreen() {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var fileList by remember { mutableStateOf(listOf<File>()) }
-    var selectedFileContent by remember { mutableStateOf<String?>(null) }
-    var isConnected by remember { mutableStateOf(false) }
-    var lastConnectedTime by remember { mutableStateOf<String?>(null) }
+fun MatchFilesScreen(
+    matchFiles: List<MainActivity.MatchFile>,
+    isRequestingFiles: Boolean,
+    onRefreshClicked: () -> Unit,
+    onWatchStatusChecked: ((String?) -> Unit) -> Unit,
+    onSaveFile: (MainActivity.MatchFile) -> Unit,
+    onDeleteFile: (MainActivity.MatchFile) -> Unit
+) {
+    var watchStatus by remember { mutableStateOf<String?>("Checking watch status...") }
+    var lastConnected by remember { mutableStateOf("Last Connected: N/A") }
 
-    // SharedPreferences to retrieve last connection time
-    val sharedPreferences: SharedPreferences = context.getSharedPreferences("BowlsFilesPrefs", Context.MODE_PRIVATE)
-
-    // Function to refresh the file list
-    fun refreshFileList() {
-        fileList = context.filesDir.listFiles()?.filter { it.name.startsWith("B") }?.sortedBy { it.name } ?: emptyList()
-    }
-
-    // Function to update connection status
-    fun updateConnectionStatus() {
-        scope.launch {
-            isConnected = isWatchConnected(context)
-            val lastTimeMillis = sharedPreferences.getLong("last_connection_time", 0L)
-            lastConnectedTime = if (lastTimeMillis > 0) {
-                val date = Date(lastTimeMillis)
-                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(date)
-            } else {
-                "Never"
-            }
-        }
-    }
-
-    // Periodically check connection status and refresh the file list
     LaunchedEffect(Unit) {
-        while (true) {
-            updateConnectionStatus()
-            refreshFileList()
-            delay(5000) // Update every 5 seconds
+        onWatchStatusChecked { status ->
+            watchStatus = status
         }
-    }
-
-    // Dialog for viewing file content
-    if (selectedFileContent != null) {
-        AlertDialog(
-            onDismissRequest = { selectedFileContent = null },
-            title = { Text("Match Details", fontSize = 20.sp) },
-            text = {
-                Text(
-                    text = selectedFileContent ?: "No content",
-                    fontSize = 16.sp,
-                    textAlign = TextAlign.Start
-                )
-            },
-            confirmButton = {
-                Button(onClick = { selectedFileContent = null }) {
-                    Text("Close")
-                }
-            }
-        )
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Title and Refresh button
-        Row(
+        Text(
+            text = watchStatus ?: "Watch Status: Unknown",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = when (watchStatus) {
+                "Watch Connected: Yes" -> Color.Green
+                "Watch Connected: No" -> Color.Red
+                "Watch Connected: Error" -> Color.Red
+                else -> Color.Gray
+            }
+        )
+
+        Text(
+            text = lastConnected,
+            fontSize = 14.sp,
+            color = Color.Gray
+        )
+
+        Button(
+            onClick = {
+                onRefreshClicked()
+                lastConnected = "Last Connected: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())}"
+            },
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            enabled = !isRequestingFiles
         ) {
-            Text(
-                text = "Bowls Scorer Files",
-                fontSize = 24.sp,
-                modifier = Modifier.padding(bottom = 16.dp)
-            )
-            Button(
-                onClick = {
-                    refreshFileList()
-                    updateConnectionStatus()
-                },
-                modifier = Modifier.padding(bottom = 12.dp)
-            ) {
+            if (isRequestingFiles) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(24.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp
+                )
+            } else {
                 Text("Refresh")
             }
         }
 
-        // Connection status
-        Text(
-            text = "Watch Connected: ${if (isConnected) "Yes" else "No"}",
-            fontSize = 16.sp,
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-        Text(
-            text = "Last Connected: ${lastConnectedTime ?: "Never"}",
-            fontSize = 16.sp,
-            modifier = Modifier.padding(bottom = 16.dp)
-        )
-
-        // File list
-        if (fileList.isEmpty()) {
+        if (matchFiles.isEmpty()) {
             Text(
-                text = "No match files found",
-                fontSize = 18.sp,
-                modifier = Modifier.padding(16.dp)
+                text = if (isRequestingFiles) "Loading match files..." else "No match files found",
+                fontSize = 16.sp,
+                color = Color.Gray,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
         } else {
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f)
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(fileList) { file ->
-                    Row(
+                items(matchFiles) { matchFile ->
+                    Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = file.name,
-                            fontSize = 18.sp,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable {
-                                    selectedFileContent = file.readText()
-                                }
-                                .padding(end = 8.dp)
+                            .padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color(0xFFF5F5F5)
                         )
-                        Row {
-                            Button(
-                                onClick = {
-                                    val intent = Intent(Intent.ACTION_SEND).apply {
-                                        type = "text/plain"
-                                        putExtra(Intent.EXTRA_TEXT, file.readText())
-                                        putExtra(Intent.EXTRA_SUBJECT, "Bowls Scorer Match: ${file.name}")
-                                    }
-                                    context.startActivity(Intent.createChooser(intent, "Share Match File"))
-                                },
-                                modifier = Modifier.padding(end = 8.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(8.dp)
+                        ) {
+                            Text(
+                                text = matchFile.summary,
+                                fontSize = 14.sp
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text("Share")
-                            }
-                            Button(
-                                onClick = {
-                                    file.delete()
-                                    refreshFileList()
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                            ) {
-                                Text("Delete")
+                                Button(
+                                    onClick = { onSaveFile(matchFile) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color.Green,
+                                        contentColor = Color.White
+                                    ),
+                                    modifier = Modifier.weight(1f).padding(end = 4.dp)
+                                ) {
+                                    Text("Save", fontSize = 12.sp)
+                                }
+                                Button(
+                                    onClick = { onDeleteFile(matchFile) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color.Red,
+                                        contentColor = Color.White
+                                    ),
+                                    modifier = Modifier.weight(1f).padding(start = 4.dp)
+                                ) {
+                                    Text("Delete", fontSize = 12.sp)
+                                }
                             }
                         }
                     }
